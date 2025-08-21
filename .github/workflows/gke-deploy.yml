@@ -1,0 +1,394 @@
+# Build and Deploy to GKE
+
+name: 'Build and Deploy to GKE'
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GAR_LOCATION: ${{ secrets.GAR_LOCATION }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
+  GKE_ZONE: ${{ secrets.GKE_ZONE }}
+  REPOSITORY: ${{ secrets.GAR_REPOSITORY }}
+  WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_ID_PROVIDER }}
+  SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+jobs:
+  build-push-deploy:
+    name: 'Setup, Build, Publish, and Deploy'
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 'Setup Node'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: 'Install pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+      - name: 'Prepare .npmrc for GitHub Packages'
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{secrets.GITHUB_TOKEN}}" > ~/.npmrc
+
+      - name: 'Install dependencies'
+        run: node common/scripts/install-run-rush.js install
+
+      - name: 'Build source'
+        run: node common/scripts/install-run-rush.js build
+
+      - name: 'Bundle source'
+        run: node common/scripts/install-run-rush.js bundle
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud (WIF)'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: '${{ env.WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ env.SERVICE_ACCOUNT }}'
+
+      - name: 'Setup gcloud CLI'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: '${{ env.PROJECT_ID }}'
+
+      - name: 'Docker Auth to Artifact Registry'
+        uses: docker/login-action@v3
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.auth_token }}'
+          registry: '${{ env.GAR_LOCATION }}-docker.pkg.dev'
+
+      - name: 'Set up GKE credentials'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: '${{ env.GKE_CLUSTER }}'
+          location: '${{ env.GKE_ZONE }}'
+
+      - name: 'Fetch GSM secrets for DB credentials (optional)'
+        id: gsmdb
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        continue-on-error: true
+        with:
+          secrets: |
+            CRDB_USER:projects/${{ env.PROJECT_ID }}/secrets/CRDB_USER/versions/latest
+            CRDB_PASSWORD:projects/${{ env.PROJECT_ID }}/secrets/CRDB_PASSWORD/versions/latest
+            MONGO_ROOT_USER:projects/${{ env.PROJECT_ID }}/secrets/MONGO_ROOT_USER/versions/latest
+            MONGO_ROOT_PASSWORD:projects/${{ env.PROJECT_ID }}/secrets/MONGO_ROOT_PASSWORD/versions/latest
+
+      - name: 'Compute DB credentials (generate if absent)'
+        id: dbcreds
+        env:
+          CRDB_USER_IN: ${{ steps.gsmdb.outputs.CRDB_USER || secrets.CRDB_USER }}
+          CRDB_PASSWORD_IN: ${{ steps.gsmdb.outputs.CRDB_PASSWORD || secrets.CRDB_PASSWORD }}
+          MONGO_ROOT_USER_IN: ${{ steps.gsmdb.outputs.MONGO_ROOT_USER || secrets.MONGO_ROOT_USER }}
+          MONGO_ROOT_PASSWORD_IN: ${{ steps.gsmdb.outputs.MONGO_ROOT_PASSWORD || secrets.MONGO_ROOT_PASSWORD }}
+        run: |
+          crdb_user="${CRDB_USER_IN:-huly}"
+          crdb_pass="${CRDB_PASSWORD_IN:-}"
+          if [ -z "$crdb_pass" ]; then
+            crdb_pass=$(openssl rand -base64 24 | tr -d '\n')
+          fi
+          mongo_user="${MONGO_ROOT_USER_IN:-root}"
+          mongo_pass="${MONGO_ROOT_PASSWORD_IN:-}"
+          if [ -z "$mongo_pass" ]; then
+            mongo_pass=$(openssl rand -base64 24 | tr -d '\n')
+          fi
+          echo "CRDB_USER=$crdb_user" >> $GITHUB_OUTPUT
+          echo "CRDB_PASSWORD=$crdb_pass" >> $GITHUB_OUTPUT
+          echo "MONGO_ROOT_USER=$mongo_user" >> $GITHUB_OUTPUT
+          echo "MONGO_ROOT_PASSWORD=$mongo_pass" >> $GITHUB_OUTPUT
+
+      - name: 'Persist generated DB credentials to GSM'
+        env:
+          CRDB_USER: ${{ steps.dbcreds.outputs.CRDB_USER }}
+          CRDB_PASSWORD: ${{ steps.dbcreds.outputs.CRDB_PASSWORD }}
+          MONGO_ROOT_USER: ${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}
+          MONGO_ROOT_PASSWORD: ${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ensure_secret () {
+            local s="$1"
+            gcloud secrets describe "$s" --project="$PROJECT_ID" >/dev/null 2>&1 || \
+              gcloud secrets create "$s" --replication-policy=automatic --project="$PROJECT_ID"
+          }
+          add_version () {
+            local s="$1"; local v="$2"
+            if [ -n "$v" ]; then
+              printf %s "$v" | gcloud secrets versions add "$s" --project="$PROJECT_ID" --data-file=- >/dev/null
+            fi
+          }
+          ensure_secret CRDB_USER
+          ensure_secret CRDB_PASSWORD
+          ensure_secret MONGO_ROOT_USER
+          ensure_secret MONGO_ROOT_PASSWORD
+          add_version CRDB_USER "$CRDB_USER"
+          add_version CRDB_PASSWORD "$CRDB_PASSWORD"
+          add_version MONGO_ROOT_USER "$MONGO_ROOT_USER"
+          add_version MONGO_ROOT_PASSWORD "$MONGO_ROOT_PASSWORD"
+
+      - name: 'Set up Helm'
+        uses: azure/setup-helm@v4
+
+      - name: 'Install in-cluster databases (CockroachDB and MongoDB)'
+        run: |
+          kubectl get ns huly >/dev/null 2>&1 || kubectl create namespace huly
+          helm repo add cockroachdb https://charts.cockroachdb.com || true
+          helm repo add bitnami https://charts.bitnami.com/bitnami || true
+          helm repo update
+          # CockroachDB - TLS enabled with self-signed certs, 3 replicas
+          helm upgrade --install huly-crdb cockroachdb/cockroachdb \
+            --namespace huly --create-namespace \
+            --set tls.enabled=true \
+            --set tls.certs.selfSigner.enabled=true \
+            --set statefulset.replicas=3
+          # Wait for CockroachDB to be ready
+          kubectl -n huly rollout status statefulset/huly-crdb-cockroachdb --timeout=600s
+          # Create SQL user with password over TLS inside the pod
+          kubectl -n huly exec huly-crdb-cockroachdb-0 -- \
+            bash -lc "cockroach sql --certs-dir=/cockroach/cockroach-certs --host=huly-crdb-cockroachdb-public -u root -e \"CREATE USER IF NOT EXISTS '${{ steps.dbcreds.outputs.CRDB_USER }}' WITH PASSWORD '${{ steps.dbcreds.outputs.CRDB_PASSWORD }}'; GRANT admin TO '${{ steps.dbcreds.outputs.CRDB_USER }}';\""
+          # MongoDB - standalone, no auth for self-host simplicity; adjust for auth in prod
+          helm upgrade --install huly-mongo bitnami/mongodb \
+            --namespace huly --create-namespace \
+            --set architecture=standalone \
+            --set auth.enabled=true \
+            --set auth.rootUser='${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}' \
+            --set auth.rootPassword='${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}' \
+            --set networkPolicy.enabled=true \
+            --set networkPolicy.allowExternal=false
+
+      - name: 'Compute image tag'
+        id: vars
+        run: |
+          echo "tag=${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+      - name: 'Build local Docker images (core pods and optional services)'
+        env:
+          DOCKER_CLI_HINTS: 'false'
+          DOCKER_EXTRA: '--platform=linux/amd64'
+        run: |
+          # Build key images from local Dockerfiles to ensure our changes are included
+          docker build -t ${{ steps.vars.outputs.tag }}/front:${GITHUB_SHA} ./pods/front
+          docker build -t ${{ steps.vars.outputs.tag }}/server:${GITHUB_SHA} ./pods/server
+          docker build -t ${{ steps.vars.outputs.tag }}/account:${GITHUB_SHA} ./pods/account
+          # Optional workspace utility image (not deployed by default)
+          if [ -f ./pods/workspace/Dockerfile ]; then
+            docker build -t ${{ steps.vars.outputs.tag }}/workspace:${GITHUB_SHA} ./pods/workspace
+          fi
+          # Optional services (build if dirs exist)
+          for svc in pods/media pods/stats pods/collaborator pods/fulltext; do
+            if [ -f "$svc/Dockerfile" ]; then
+              name=$(basename "$svc")
+              docker build -t ${{ steps.vars.outputs.tag }}/${name}:${GITHUB_SHA} "$svc"
+            fi
+          done
+          # Addons: notifications mailer, AI bot, and Love (meetings)
+          if [ -f ./services/mail/pod-mail/Dockerfile ]; then
+            docker build -t ${{ steps.vars.outputs.tag }}/mail:${GITHUB_SHA} ./services/mail/pod-mail
+          fi
+          if [ -f ./services/mail/pod-mail-worker/Dockerfile ]; then
+            docker build -t ${{ steps.vars.outputs.tag }}/mail-worker:${GITHUB_SHA} ./services/mail/pod-mail-worker
+          fi
+          if [ -f ./services/ai-bot/pod-ai-bot/Dockerfile ]; then
+            docker build -t ${{ steps.vars.outputs.tag }}/ai-bot:${GITHUB_SHA} ./services/ai-bot/pod-ai-bot
+          fi
+          if [ -f ./services/love/Dockerfile ]; then
+            docker build -t ${{ steps.vars.outputs.tag }}/love:${GITHUB_SHA} ./services/love
+          fi
+
+      - name: 'Push images to Artifact Registry'
+        run: |
+          for img in front server account workspace media stats collaborator fulltext mail mail-worker ai-bot love; do
+            if docker image inspect "${{ steps.vars.outputs.tag }}/${img}:${GITHUB_SHA}" >/dev/null 2>&1; then
+              docker push "${{ steps.vars.outputs.tag }}/${img}:${GITHUB_SHA}"
+            fi
+          done
+
+      - name: 'Install kubectl kustomize plugin'
+        run: |
+          curl -sSL -o kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version | cat
+
+      - name: 'Prepare kustomize (if present)'
+        id: km
+        run: |
+          KDIR=""
+          if [ -f "kube/overlays/prod/kustomization.yaml" ] || [ -f "kube/overlays/prod/kustomization.yml" ]; then
+            KDIR="kube/overlays/prod"
+          elif [ -f "kube/base/kustomization.yaml" ] || [ -f "kube/base/kustomization.yml" ]; then
+            KDIR="kube/base"
+          elif [ -f "kustomization.yaml" ] || [ -f "kustomization.yml" ]; then
+            KDIR="."
+          fi
+          if [ -n "$KDIR" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "dir=$KDIR" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 'Fetch secrets from Google Secret Manager (optional)'
+        id: gsm
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        continue-on-error: true
+        with:
+          secrets: |
+            SERVER_SECRET:projects/${{ env.PROJECT_ID }}/secrets/SERVER_SECRET/versions/latest
+            DB_URL:projects/${{ env.PROJECT_ID }}/secrets/DB_URL/versions/latest
+            MONGO_URL:projects/${{ env.PROJECT_ID }}/secrets/MONGO_URL/versions/latest
+            TRANSACTOR_URL:projects/${{ env.PROJECT_ID }}/secrets/TRANSACTOR_URL/versions/latest
+            QUEUE_CONFIG:projects/${{ env.PROJECT_ID }}/secrets/QUEUE_CONFIG/versions/latest
+            STORAGE_CONFIG:projects/${{ env.PROJECT_ID }}/secrets/STORAGE_CONFIG/versions/latest
+            ELASTIC_URL:projects/${{ env.PROJECT_ID }}/secrets/ELASTIC_URL/versions/latest
+            FRONT_URL:projects/${{ env.PROJECT_ID }}/secrets/FRONT_URL/versions/latest
+            ACCOUNTS_URL:projects/${{ env.PROJECT_ID }}/secrets/ACCOUNTS_URL/versions/latest
+            MAIL_URL:projects/${{ env.PROJECT_ID }}/secrets/MAIL_URL/versions/latest
+            MAIL_AUTH_TOKEN:projects/${{ env.PROJECT_ID }}/secrets/MAIL_AUTH_TOKEN/versions/latest
+            SMTP_HOST:projects/${{ env.PROJECT_ID }}/secrets/SMTP_HOST/versions/latest
+            SMTP_PORT:projects/${{ env.PROJECT_ID }}/secrets/SMTP_PORT/versions/latest
+            SMTP_USERNAME:projects/${{ env.PROJECT_ID }}/secrets/SMTP_USERNAME/versions/latest
+            SMTP_PASSWORD:projects/${{ env.PROJECT_ID }}/secrets/SMTP_PASSWORD/versions/latest
+            OPENAI_API_KEY:projects/${{ env.PROJECT_ID }}/secrets/OPENAI_API_KEY/versions/latest
+            OPENAI_BASE_URL:projects/${{ env.PROJECT_ID }}/secrets/OPENAI_BASE_URL/versions/latest
+            AI_URL:projects/${{ env.PROJECT_ID }}/secrets/AI_URL/versions/latest
+            AI_BOT_URL:projects/${{ env.PROJECT_ID }}/secrets/AI_BOT_URL/versions/latest
+            LOVE_ENDPOINT:projects/${{ env.PROJECT_ID }}/secrets/LOVE_ENDPOINT/versions/latest
+            LIVEKIT_HOST:projects/${{ env.PROJECT_ID }}/secrets/LIVEKIT_HOST/versions/latest
+            LIVEKIT_API_KEY:projects/${{ env.PROJECT_ID }}/secrets/LIVEKIT_API_KEY/versions/latest
+            LIVEKIT_API_SECRET:projects/${{ env.PROJECT_ID }}/secrets/LIVEKIT_API_SECRET/versions/latest
+            LIVEKIT_WS:projects/${{ env.PROJECT_ID }}/secrets/LIVEKIT_WS/versions/latest
+            GITHUB_CLIENT_ID:projects/${{ env.PROJECT_ID }}/secrets/GITHUB_CLIENT_ID/versions/latest
+            GITHUB_CLIENT_SECRET:projects/${{ env.PROJECT_ID }}/secrets/GITHUB_CLIENT_SECRET/versions/latest
+            OPENID_CLIENT_ID:projects/${{ env.PROJECT_ID }}/secrets/OPENID_CLIENT_ID/versions/latest
+            OPENID_CLIENT_SECRET:projects/${{ env.PROJECT_ID }}/secrets/OPENID_CLIENT_SECRET/versions/latest
+            OPENID_ISSUER:projects/${{ env.PROJECT_ID }}/secrets/OPENID_ISSUER/versions/latest
+            DISABLE_SIGNUP:projects/${{ env.PROJECT_ID }}/secrets/DISABLE_SIGNUP/versions/latest
+
+      - name: 'Create/update Kubernetes Secret (GSM with GitHub fallback)'
+        if: steps.km.outputs.exists == 'true'
+        env:
+          SERVER_SECRET: ${{ steps.gsm.outputs.SERVER_SECRET || secrets.SERVER_SECRET }}
+          DB_URL: ${{ steps.gsm.outputs.DB_URL || secrets.DB_URL }}
+          MONGO_URL: ${{ steps.gsm.outputs.MONGO_URL || secrets.MONGO_URL }}
+          TRANSACTOR_URL: ${{ steps.gsm.outputs.TRANSACTOR_URL || secrets.TRANSACTOR_URL }}
+          POSTGRES_OPTIONS: ${{ secrets.POSTGRES_OPTIONS }}
+          QUEUE_CONFIG: ${{ steps.gsm.outputs.QUEUE_CONFIG || secrets.QUEUE_CONFIG }}
+          STORAGE_CONFIG: ${{ steps.gsm.outputs.STORAGE_CONFIG || secrets.STORAGE_CONFIG }}
+          ELASTIC_URL: ${{ steps.gsm.outputs.ELASTIC_URL || secrets.ELASTIC_URL }}
+          FRONT_URL: ${{ steps.gsm.outputs.FRONT_URL || secrets.FRONT_URL }}
+          ACCOUNTS_URL: ${{ steps.gsm.outputs.ACCOUNTS_URL || secrets.ACCOUNTS_URL }}
+          MAIL_URL: ${{ steps.gsm.outputs.MAIL_URL || secrets.MAIL_URL }}
+          MAIL_AUTH_TOKEN: ${{ steps.gsm.outputs.MAIL_AUTH_TOKEN || secrets.MAIL_AUTH_TOKEN }}
+          SMTP_HOST: ${{ steps.gsm.outputs.SMTP_HOST || secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ steps.gsm.outputs.SMTP_PORT || secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ steps.gsm.outputs.SMTP_USERNAME || secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ steps.gsm.outputs.SMTP_PASSWORD || secrets.SMTP_PASSWORD }}
+          OPENAI_API_KEY: ${{ steps.gsm.outputs.OPENAI_API_KEY || secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ steps.gsm.outputs.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          AI_URL: ${{ steps.gsm.outputs.AI_URL || secrets.AI_URL }}
+          AI_BOT_URL: ${{ steps.gsm.outputs.AI_BOT_URL || secrets.AI_BOT_URL }}
+          LOVE_ENDPOINT: ${{ steps.gsm.outputs.LOVE_ENDPOINT || secrets.LOVE_ENDPOINT }}
+          LIVEKIT_HOST: ${{ steps.gsm.outputs.LIVEKIT_HOST || secrets.LIVEKIT_HOST }}
+          LIVEKIT_API_KEY: ${{ steps.gsm.outputs.LIVEKIT_API_KEY || secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ steps.gsm.outputs.LIVEKIT_API_SECRET || secrets.LIVEKIT_API_SECRET }}
+          LIVEKIT_WS: ${{ steps.gsm.outputs.LIVEKIT_WS || secrets.LIVEKIT_WS }}
+          GITHUB_CLIENT_ID: ${{ steps.gsm.outputs.GITHUB_CLIENT_ID || secrets.GITHUB_CLIENT_ID }}
+          GITHUB_CLIENT_SECRET: ${{ steps.gsm.outputs.GITHUB_CLIENT_SECRET || secrets.GITHUB_CLIENT_SECRET }}
+          OPENID_CLIENT_ID: ${{ steps.gsm.outputs.OPENID_CLIENT_ID || secrets.OPENID_CLIENT_ID }}
+          OPENID_CLIENT_SECRET: ${{ steps.gsm.outputs.OPENID_CLIENT_SECRET || secrets.OPENID_CLIENT_SECRET }}
+          OPENID_ISSUER: ${{ steps.gsm.outputs.OPENID_ISSUER || secrets.OPENID_ISSUER }}
+          DISABLE_SIGNUP: ${{ steps.gsm.outputs.DISABLE_SIGNUP || secrets.DISABLE_SIGNUP }}
+        run: |
+          kubectl get ns huly >/dev/null 2>&1 || kubectl create namespace huly
+          # Default to in-cluster DB services if not provided by GSM or GitHub
+          : "${DB_URL:=postgresql://${{ steps.dbcreds.outputs.CRDB_USER }}:${{ steps.dbcreds.outputs.CRDB_PASSWORD }}@huly-crdb-cockroachdb-public:26257/defaultdb?sslmode=require}"
+          : "${MONGO_URL:=mongodb://${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}:${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}@huly-mongo-mongodb:27017/?authSource=admin}"
+          : "${TRANSACTOR_URL:=ws://server:3333}"
+          # Try to fetch CockroachDB CA from TLS secrets to verify server certs
+          PG_CA=$(kubectl -n huly get secret huly-crdb-cockroachdb-node -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d || true)
+          if [ -z "$PG_CA" ]; then
+            PG_CA=$(kubectl -n huly get secret huly-crdb-cockroachdb-client-secret -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d || true)
+          fi
+          if [ -n "$PG_CA" ]; then
+            # Build JSON: {"ssl": {"ca": "...PEM..."}}
+            PG_CA_ESC=$(printf '%s' "$PG_CA" | awk '{printf "%s\\n",$0}')
+            POSTGRES_OPTIONS=$(printf '{"ssl":{"ca":"%s"}}' "$PG_CA_ESC")
+          else
+            : "${POSTGRES_OPTIONS:={\"ssl\":true}}"
+          fi
+          # Create/update a secret with optional keys; missing ones will be empty
+          kubectl -n huly create secret generic huly-secrets \
+            --from-literal=SERVER_SECRET="$SERVER_SECRET" \
+            --from-literal=DB_URL="$DB_URL" \
+            --from-literal=MONGO_URL="$MONGO_URL" \
+            --from-literal=POSTGRES_OPTIONS="$POSTGRES_OPTIONS" \
+            --from-literal=TRANSACTOR_URL="$TRANSACTOR_URL" \
+            --from-literal=QUEUE_CONFIG="$QUEUE_CONFIG" \
+            --from-literal=STORAGE_CONFIG="$STORAGE_CONFIG" \
+            --from-literal=ELASTIC_URL="$ELASTIC_URL" \
+            --from-literal=FRONT_URL="$FRONT_URL" \
+            --from-literal=ACCOUNTS_URL="$ACCOUNTS_URL" \
+            --from-literal=MAIL_URL="$MAIL_URL" \
+            --from-literal=MAIL_AUTH_TOKEN="$MAIL_AUTH_TOKEN" \
+            --from-literal=SMTP_HOST="$SMTP_HOST" \
+            --from-literal=SMTP_PORT="$SMTP_PORT" \
+            --from-literal=SMTP_USERNAME="$SMTP_USERNAME" \
+            --from-literal=SMTP_PASSWORD="$SMTP_PASSWORD" \
+            --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+            --from-literal=OPENAI_BASE_URL="$OPENAI_BASE_URL" \
+            --from-literal=AI_URL="$AI_URL" \
+            --from-literal=AI_BOT_URL="$AI_BOT_URL" \
+            --from-literal=LOVE_ENDPOINT="$LOVE_ENDPOINT" \
+            --from-literal=LIVEKIT_HOST="$LIVEKIT_HOST" \
+            --from-literal=LIVEKIT_API_KEY="$LIVEKIT_API_KEY" \
+            --from-literal=LIVEKIT_API_SECRET="$LIVEKIT_API_SECRET" \
+            --from-literal=LIVEKIT_WS="$LIVEKIT_WS" \
+            --from-literal=GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
+            --from-literal=GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
+            --from-literal=OPENID_CLIENT_ID="$OPENID_CLIENT_ID" \
+            --from-literal=OPENID_CLIENT_SECRET="$OPENID_CLIENT_SECRET" \
+            --from-literal=OPENID_ISSUER="$OPENID_ISSUER" \
+            --from-literal=DISABLE_SIGNUP="$DISABLE_SIGNUP" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: 'Deploy to GKE (kustomize)'
+        if: steps.km.outputs.exists == 'true'
+        env:
+          IMG_TAG: '${{ steps.vars.outputs.tag }}'
+        run: |
+          cd "${{ steps.km.outputs.dir }}"
+          # Replace image references to Artifact Registry with current SHA tag
+          kustomize edit set image front=$IMG_TAG/front:${GITHUB_SHA}
+          kustomize edit set image server=$IMG_TAG/server:${GITHUB_SHA}
+          kustomize edit set image account=$IMG_TAG/account:${GITHUB_SHA}
+          # Optional addons
+          kustomize edit set image mail=$IMG_TAG/mail:${GITHUB_SHA} || true
+          kustomize edit set image mail-worker=$IMG_TAG/mail-worker:${GITHUB_SHA} || true
+          kustomize edit set image ai-bot=$IMG_TAG/ai-bot:${GITHUB_SHA} || true
+          kustomize edit set image love=$IMG_TAG/love:${GITHUB_SHA} || true
+          kustomize build . | kubectl apply -f -
+          kubectl rollout status deployment -n huly --timeout=180s || true
+
+      - name: 'Deploy using kubectl manifests (fallback)'
+        if: steps.km.outputs.exists != 'true'
+        run: |
+          echo "No kustomization.yaml found; skipping deploy"
