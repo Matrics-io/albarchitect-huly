@@ -71,6 +71,58 @@ gcloud artifacts repositories create "$REPO" \
     - roles/container.admin (or granular k8s access if you prefer RBAC)
     - roles/secretmanager.secretAccessor
 
+Example commands (replace owner/repo):
+
+```bash
+PROJECT_ID=$(gcloud config get-value project)
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+
+# Vars
+POOL_ID=github-pool
+PROVIDER_ID=github-oidc
+SA_NAME=gh-actions-deploy
+REPO="owner/repo"   # e.g., erzenkrasniqi/albarchitect-huly
+
+# Create Workload Identity Pool and Provider
+gcloud iam workload-identity-pools create "$POOL_ID" \
+  --project="$PROJECT_ID" --location=global \
+  --display-name="GitHub Actions Pool"
+
+gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+  --project="$PROJECT_ID" --location=global \
+  --workload-identity-pool="$POOL_ID" \
+  --display-name="GitHub OIDC" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref"
+
+# Create Service Account
+gcloud iam service-accounts create "$SA_NAME" \
+  --project="$PROJECT_ID" \
+  --display-name="GitHub Actions Deploy"
+
+SA_EMAIL="$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
+
+# Grant deploy roles to the SA
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/container.admin"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/secretmanager.secretAccessor"
+
+# Allow GitHub repo identities from the pool to impersonate the SA
+gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+  --project="$PROJECT_ID" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/attribute.repository/$REPO"
+
+# Output provider resource name for GitHub Secret GCP_WORKLOAD_ID_PROVIDER
+echo "projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL_ID/providers/$PROVIDER_ID"
+
+# Output SA email for GitHub Secret GCP_SERVICE_ACCOUNT
+echo "$SA_EMAIL"
+```
+
 6. Create the Kubernetes namespace (workflow will create it if missing, but doing it once is fine):
 
 ```bash
