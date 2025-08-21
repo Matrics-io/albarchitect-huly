@@ -162,7 +162,7 @@ jobs:
           kubectl -n huly rollout status statefulset/huly-crdb-cockroachdb --timeout=600s
           # Create SQL user with password over TLS inside the pod
           kubectl -n huly exec huly-crdb-cockroachdb-0 -- \
-            bash -lc "cockroach sql --certs-dir=/cockroach/cockroach-certs --host=huly-crdb-cockroachdb-public -e \"CREATE USER IF NOT EXISTS '${{ steps.dbcreds.outputs.CRDB_USER }}' WITH PASSWORD '${{ steps.dbcreds.outputs.CRDB_PASSWORD }}'; GRANT admin TO '${{ steps.dbcreds.outputs.CRDB_USER }}';\""
+            bash -lc "cockroach sql --certs-dir=/cockroach/cockroach-certs --host=huly-crdb-cockroachdb-public -u root -e \"CREATE USER IF NOT EXISTS '${{ steps.dbcreds.outputs.CRDB_USER }}' WITH PASSWORD '${{ steps.dbcreds.outputs.CRDB_PASSWORD }}'; GRANT admin TO '${{ steps.dbcreds.outputs.CRDB_USER }}';\""
           # MongoDB - standalone, no auth for self-host simplicity; adjust for auth in prod
           helm upgrade --install huly-mongo bitnami/mongodb \
             --namespace huly --create-namespace \
