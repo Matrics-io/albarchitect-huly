@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: front
+  labels:
+    app: front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: front
+  template:
+    metadata:
+      labels:
+        app: front
+    spec:
+      containers:
+        - name: front
+          image: front
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: SERVER_SECRET
+            - name: ACCOUNTS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: ACCOUNTS_URL
+            - name: FRONT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: FRONT_URL
+            - name: DISABLE_SIGNUP
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: DISABLE_SIGNUP
+
+

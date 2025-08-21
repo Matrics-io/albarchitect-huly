@@ -81,44 +81,31 @@ jobs:
           cluster_name: '${{ env.GKE_CLUSTER }}'
           location: '${{ env.GKE_ZONE }}'
 
-      - name: 'Fetch GSM secrets for DB credentials (optional)'
+      - name: 'Fetch GSM secrets for MongoDB credentials (optional)'
         id: gsmdb
         uses: google-github-actions/get-secretmanager-secrets@v2
         continue-on-error: true
         with:
           secrets: |
-            CRDB_USER:projects/${{ env.PROJECT_ID }}/secrets/CRDB_USER/versions/latest
-            CRDB_PASSWORD:projects/${{ env.PROJECT_ID }}/secrets/CRDB_PASSWORD/versions/latest
             MONGO_ROOT_USER:projects/${{ env.PROJECT_ID }}/secrets/MONGO_ROOT_USER/versions/latest
             MONGO_ROOT_PASSWORD:projects/${{ env.PROJECT_ID }}/secrets/MONGO_ROOT_PASSWORD/versions/latest
 
-      - name: 'Compute DB credentials (generate if absent)'
+      - name: 'Compute MongoDB credentials (generate if absent)'
         id: dbcreds
         env:
-          CRDB_USER_IN: ${{ steps.gsmdb.outputs.CRDB_USER || secrets.CRDB_USER }}
-          CRDB_PASSWORD_IN: ${{ steps.gsmdb.outputs.CRDB_PASSWORD || secrets.CRDB_PASSWORD }}
           MONGO_ROOT_USER_IN: ${{ steps.gsmdb.outputs.MONGO_ROOT_USER || secrets.MONGO_ROOT_USER }}
           MONGO_ROOT_PASSWORD_IN: ${{ steps.gsmdb.outputs.MONGO_ROOT_PASSWORD || secrets.MONGO_ROOT_PASSWORD }}
         run: |
-          crdb_user="${CRDB_USER_IN:-huly}"
-          crdb_pass="${CRDB_PASSWORD_IN:-}"
-          if [ -z "$crdb_pass" ]; then
-            crdb_pass=$(openssl rand -base64 24 | tr -d '\n')
-          fi
           mongo_user="${MONGO_ROOT_USER_IN:-root}"
           mongo_pass="${MONGO_ROOT_PASSWORD_IN:-}"
           if [ -z "$mongo_pass" ]; then
             mongo_pass=$(openssl rand -base64 24 | tr -d '\n')
           fi
-          echo "CRDB_USER=$crdb_user" >> $GITHUB_OUTPUT
-          echo "CRDB_PASSWORD=$crdb_pass" >> $GITHUB_OUTPUT
           echo "MONGO_ROOT_USER=$mongo_user" >> $GITHUB_OUTPUT
           echo "MONGO_ROOT_PASSWORD=$mongo_pass" >> $GITHUB_OUTPUT
 
-      - name: 'Persist generated DB credentials to GSM'
+      - name: 'Persist generated MongoDB credentials to GSM'
         env:
-          CRDB_USER: ${{ steps.dbcreds.outputs.CRDB_USER }}
-          CRDB_PASSWORD: ${{ steps.dbcreds.outputs.CRDB_PASSWORD }}
           MONGO_ROOT_USER: ${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}
           MONGO_ROOT_PASSWORD: ${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}
         run: |
@@ -134,44 +121,57 @@ jobs:
               printf %s "$v" | gcloud secrets versions add "$s" --project="$PROJECT_ID" --data-file=- >/dev/null
             fi
           }
-          ensure_secret CRDB_USER
-          ensure_secret CRDB_PASSWORD
           ensure_secret MONGO_ROOT_USER
           ensure_secret MONGO_ROOT_PASSWORD
-          add_version CRDB_USER "$CRDB_USER"
-          add_version CRDB_PASSWORD "$CRDB_PASSWORD"
           add_version MONGO_ROOT_USER "$MONGO_ROOT_USER"
           add_version MONGO_ROOT_PASSWORD "$MONGO_ROOT_PASSWORD"
 
       - name: 'Set up Helm'
         uses: azure/setup-helm@v4
 
-      - name: 'Install in-cluster databases (CockroachDB and MongoDB)'
+      - name: 'Install in-cluster database (MongoDB with TLS)'
         run: |
           kubectl get ns huly >/dev/null 2>&1 || kubectl create namespace huly
-          helm repo add cockroachdb https://charts.cockroachdb.com || true
           helm repo add bitnami https://charts.bitnami.com/bitnami || true
           helm repo update
-          # CockroachDB - TLS enabled with self-signed certs, 3 replicas
-          helm upgrade --install huly-crdb cockroachdb/cockroachdb \
-            --namespace huly --create-namespace \
-            --set tls.enabled=true \
-            --set tls.certs.selfSigner.enabled=true \
-            --set statefulset.replicas=3
-          # Wait for CockroachDB to be ready
-          kubectl -n huly rollout status statefulset/huly-crdb-cockroachdb --timeout=600s
-          # Create SQL user with password over TLS inside the pod
-          kubectl -n huly exec huly-crdb-cockroachdb-0 -- \
-            bash -lc "cockroach sql --certs-dir=/cockroach/cockroach-certs --host=huly-crdb-cockroachdb-public -u root -e \"CREATE USER IF NOT EXISTS '${{ steps.dbcreds.outputs.CRDB_USER }}' WITH PASSWORD '${{ steps.dbcreds.outputs.CRDB_PASSWORD }}'; GRANT admin TO '${{ steps.dbcreds.outputs.CRDB_USER }}';\""
-          # MongoDB - standalone, no auth for self-host simplicity; adjust for auth in prod
+          # MongoDB - standalone with auth
           helm upgrade --install huly-mongo bitnami/mongodb \
             --namespace huly --create-namespace \
             --set architecture=standalone \
             --set auth.enabled=true \
             --set auth.rootUser='${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}' \
             --set auth.rootPassword='${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}' \
+            --set tls.enabled=true \
+            --set tls.mode=requireTLS \
+            --set tls.autoGenerated=true \
+            --set service.type=LoadBalancer \
             --set networkPolicy.enabled=true \
-            --set networkPolicy.allowExternal=false
+            --set networkPolicy.allowExternal=true
+
+      - id: svcs
+        name: 'Install in-cluster storage and search (MinIO, Elasticsearch)'
+        run: |
+          set -euo pipefail
+          helm repo add bitnami https://charts.bitnami.com/bitnami || true
+          helm repo update
+          # MinIO (always install)
+          minio_user="minio"
+          minio_pass=$(openssl rand -base64 24 | tr -d '\n')
+          helm upgrade --install minio bitnami/minio \
+            --namespace huly --create-namespace \
+            --set auth.rootUser="$minio_user" \
+            --set auth.rootPassword="$minio_pass" \
+            --set fullnameOverride=minio
+          echo "minio_access_key=$minio_user" >> $GITHUB_OUTPUT
+          echo "minio_secret_key=$minio_pass" >> $GITHUB_OUTPUT
+          # Elasticsearch (always install, single-node)
+          helm upgrade --install elastic bitnami/elasticsearch \
+            --namespace huly --create-namespace \
+            --set master.replicas=1 --set coordinating.replicaCount=0 --set data.replicaCount=0 \
+            --set ingest.enabled=false \
+            --set singleNode=true \
+            --set fullnameOverride=elastic
+          echo "elastic_url=http://elastic:9200" >> $GITHUB_OUTPUT
 
       - name: 'Compute image tag'
         id: vars
@@ -261,6 +261,7 @@ jobs:
             ELASTIC_URL:projects/${{ env.PROJECT_ID }}/secrets/ELASTIC_URL/versions/latest
             FRONT_URL:projects/${{ env.PROJECT_ID }}/secrets/FRONT_URL/versions/latest
             ACCOUNTS_URL:projects/${{ env.PROJECT_ID }}/secrets/ACCOUNTS_URL/versions/latest
+            STATS_URL:projects/${{ env.PROJECT_ID }}/secrets/STATS_URL/versions/latest
             MAIL_URL:projects/${{ env.PROJECT_ID }}/secrets/MAIL_URL/versions/latest
             MAIL_AUTH_TOKEN:projects/${{ env.PROJECT_ID }}/secrets/MAIL_AUTH_TOKEN/versions/latest
             SMTP_HOST:projects/${{ env.PROJECT_ID }}/secrets/SMTP_HOST/versions/latest
@@ -283,19 +284,19 @@ jobs:
             OPENID_ISSUER:projects/${{ env.PROJECT_ID }}/secrets/OPENID_ISSUER/versions/latest
             DISABLE_SIGNUP:projects/${{ env.PROJECT_ID }}/secrets/DISABLE_SIGNUP/versions/latest
 
-      - name: 'Create/update Kubernetes Secret (GSM with GitHub fallback)'
+      - name: 'Create/update Kubernetes Config and Secret (GSM with GitHub fallback)'
         if: steps.km.outputs.exists == 'true'
         env:
           SERVER_SECRET: ${{ steps.gsm.outputs.SERVER_SECRET || secrets.SERVER_SECRET }}
           DB_URL: ${{ steps.gsm.outputs.DB_URL || secrets.DB_URL }}
           MONGO_URL: ${{ steps.gsm.outputs.MONGO_URL || secrets.MONGO_URL }}
           TRANSACTOR_URL: ${{ steps.gsm.outputs.TRANSACTOR_URL || secrets.TRANSACTOR_URL }}
-          POSTGRES_OPTIONS: ${{ secrets.POSTGRES_OPTIONS }}
           QUEUE_CONFIG: ${{ steps.gsm.outputs.QUEUE_CONFIG || secrets.QUEUE_CONFIG }}
           STORAGE_CONFIG: ${{ steps.gsm.outputs.STORAGE_CONFIG || secrets.STORAGE_CONFIG }}
           ELASTIC_URL: ${{ steps.gsm.outputs.ELASTIC_URL || secrets.ELASTIC_URL }}
           FRONT_URL: ${{ steps.gsm.outputs.FRONT_URL || secrets.FRONT_URL }}
           ACCOUNTS_URL: ${{ steps.gsm.outputs.ACCOUNTS_URL || secrets.ACCOUNTS_URL }}
+          STATS_URL: ${{ steps.gsm.outputs.STATS_URL || secrets.STATS_URL }}
           MAIL_URL: ${{ steps.gsm.outputs.MAIL_URL || secrets.MAIL_URL }}
           MAIL_AUTH_TOKEN: ${{ steps.gsm.outputs.MAIL_AUTH_TOKEN || secrets.MAIL_AUTH_TOKEN }}
           SMTP_HOST: ${{ steps.gsm.outputs.SMTP_HOST || secrets.SMTP_HOST }}
@@ -319,28 +320,56 @@ jobs:
           DISABLE_SIGNUP: ${{ steps.gsm.outputs.DISABLE_SIGNUP || secrets.DISABLE_SIGNUP }}
         run: |
           kubectl get ns huly >/dev/null 2>&1 || kubectl create namespace huly
-          # Default to in-cluster DB services if not provided by GSM or GitHub
-          : "${DB_URL:=postgresql://${{ steps.dbcreds.outputs.CRDB_USER }}:${{ steps.dbcreds.outputs.CRDB_PASSWORD }}@huly-crdb-cockroachdb-public:26257/defaultdb?sslmode=require}"
+          # Default to in-cluster Mongo if not provided by GSM or GitHub
           : "${MONGO_URL:=mongodb://${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}:${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}@huly-mongo-mongodb:27017/?authSource=admin}"
-          : "${TRANSACTOR_URL:=ws://server:3333}"
-          # Try to fetch CockroachDB CA from TLS secrets to verify server certs
-          PG_CA=$(kubectl -n huly get secret huly-crdb-cockroachdb-node -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d || true)
-          if [ -z "$PG_CA" ]; then
-            PG_CA=$(kubectl -n huly get secret huly-crdb-cockroachdb-client-secret -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d || true)
+          : "${DB_URL:=${MONGO_URL}}"
+          # Enforce TLS parameters for MongoDB connections
+          case "$MONGO_URL" in
+            *tls=*) : ;;
+            *) MONGO_URL="$MONGO_URL&tls=true&tlsAllowInvalidCertificates=true" ;;
+          esac
+          case "$DB_URL" in
+            *tls=*) : ;;
+            *) DB_URL="$DB_URL&tls=true&tlsAllowInvalidCertificates=true" ;;
+          esac
+          # Ensure SERVER_SECRET exists (generate if absent)
+          if [ -z "${SERVER_SECRET}" ]; then
+            SERVER_SECRET=$(openssl rand -base64 32 | tr -d '\n')
           fi
-          if [ -n "$PG_CA" ]; then
-            # Build JSON: {"ssl": {"ca": "...PEM..."}}
-            PG_CA_ESC=$(printf '%s' "$PG_CA" | awk '{printf "%s\\n",$0}')
-            POSTGRES_OPTIONS=$(printf '{"ssl":{"ca":"%s"}}' "$PG_CA_ESC")
-          else
-            : "${POSTGRES_OPTIONS:={\"ssl\":true}}"
+          # Compute FRONT_HOST from FRONT_URL for dual-endpoint TRANSACTOR_URL
+          front_host="${FRONT_URL}"
+          if [ -n "$front_host" ]; then
+            front_host=$(printf "%s" "$front_host" | sed -E 's#^https?://##; s#/.*$##')
           fi
+          # If not provided, default TRANSACTOR_URL to internal plus external when FRONT_URL is set
+          if [ -z "${TRANSACTOR_URL}" ]; then
+            TRANSACTOR_URL="ws://server:3333"
+            if [ -n "$front_host" ]; then
+              TRANSACTOR_URL="$TRANSACTOR_URL;wss://$front_host/ws/transactor"
+            fi
+          fi
+          # Defaults based on installed in-cluster services
+          if [ -z "${STORAGE_CONFIG}" ]; then
+            STORAGE_CONFIG="minio|minio?accessKey=${{ steps.svcs.outputs.minio_access_key }}&secretKey=${{ steps.svcs.outputs.minio_secret_key }}"
+          fi
+          if [ -z "${ELASTIC_URL}" ]; then
+            ELASTIC_URL="${{ steps.svcs.outputs.elastic_url }}"
+          fi
+          # Create/update a ConfigMap for non-sensitive config
+          kubectl -n huly create configmap huly-config \
+            --from-literal=DB_URL="$DB_URL" \
+            --from-literal=MONGO_URL="$MONGO_URL" \
+            --from-literal=TRANSACTOR_URL="$TRANSACTOR_URL" \
+            --from-literal=FRONT_URL="$FRONT_URL" \
+            --from-literal=ACCOUNTS_URL="$ACCOUNTS_URL" \
+            --from-literal=STATS_URL="$STATS_URL" \
+            --from-literal=ELASTIC_URL="$ELASTIC_URL" \
+            --dry-run=client -o yaml | kubectl apply -f -
           # Create/update a secret with optional keys; missing ones will be empty
           kubectl -n huly create secret generic huly-secrets \
             --from-literal=SERVER_SECRET="$SERVER_SECRET" \
             --from-literal=DB_URL="$DB_URL" \
             --from-literal=MONGO_URL="$MONGO_URL" \
-            --from-literal=POSTGRES_OPTIONS="$POSTGRES_OPTIONS" \
             --from-literal=TRANSACTOR_URL="$TRANSACTOR_URL" \
             --from-literal=QUEUE_CONFIG="$QUEUE_CONFIG" \
             --from-literal=STORAGE_CONFIG="$STORAGE_CONFIG" \
@@ -370,6 +399,66 @@ jobs:
             --from-literal=DISABLE_SIGNUP="$DISABLE_SIGNUP" \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: 'Persist app config to GSM (ensure + add versions)'
+        env:
+          SERVER_SECRET: ${{ steps.gsm.outputs.SERVER_SECRET || secrets.SERVER_SECRET }}
+          DB_URL_IN: ${{ steps.gsm.outputs.DB_URL || secrets.DB_URL }}
+          MONGO_URL_IN: ${{ steps.gsm.outputs.MONGO_URL || secrets.MONGO_URL }}
+          TRANSACTOR_URL_IN: ${{ steps.gsm.outputs.TRANSACTOR_URL || secrets.TRANSACTOR_URL }}
+          STORAGE_CONFIG_IN: ${{ steps.gsm.outputs.STORAGE_CONFIG || secrets.STORAGE_CONFIG }}
+          ELASTIC_URL_IN: ${{ steps.gsm.outputs.ELASTIC_URL || secrets.ELASTIC_URL }}
+          FRONT_URL: ${{ steps.gsm.outputs.FRONT_URL || secrets.FRONT_URL }}
+          ACCOUNTS_URL: ${{ steps.gsm.outputs.ACCOUNTS_URL || secrets.ACCOUNTS_URL }}
+          STATS_URL: ${{ steps.gsm.outputs.STATS_URL || secrets.STATS_URL }}
+        run: |
+          set -euo pipefail
+          ensure_secret () {
+            local s="$1"
+            gcloud secrets describe "$s" --project="$PROJECT_ID" >/dev/null 2>&1 || \
+              gcloud secrets create "$s" --replication-policy=automatic --project="$PROJECT_ID"
+          }
+          add_version () {
+            local s="$1"; local v="$2"
+            if [ -n "$v" ]; then
+              printf %s "$v" | gcloud secrets versions add "$s" --project="$PROJECT_ID" --data-file=- >/dev/null
+            fi
+          }
+          # Recompute secure defaults consistent with K8s step
+          mongo_url="${MONGO_URL_IN:-mongodb://${{ steps.dbcreds.outputs.MONGO_ROOT_USER }}:${{ steps.dbcreds.outputs.MONGO_ROOT_PASSWORD }}@huly-mongo-mongodb:27017/?authSource=admin}"
+          case "$mongo_url" in *tls=*) : ;; *) mongo_url="$mongo_url&tls=true&tlsAllowInvalidCertificates=true" ;; esac
+          db_url="${DB_URL_IN:-$mongo_url}"
+          case "$db_url" in *tls=*) : ;; *) db_url="$db_url&tls=true&tlsAllowInvalidCertificates=true" ;; esac
+          front_host="${FRONT_URL}"
+          if [ -n "$front_host" ]; then front_host=$(printf "%s" "$front_host" | sed -E 's#^https?://##; s#/.*$##'); fi
+          trans_url="${TRANSACTOR_URL_IN:-}"
+          if [ -z "$trans_url" ]; then
+            trans_url="ws://server:3333"
+            if [ -n "$front_host" ]; then trans_url="$trans_url;wss://$front_host/ws/transactor"; fi
+          fi
+          storage_cfg="${STORAGE_CONFIG_IN:-minio|minio?accessKey=${{ steps.svcs.outputs.minio_access_key }}&secretKey=${{ steps.svcs.outputs.minio_secret_key }}}"
+          elastic_url="${ELASTIC_URL_IN:-${{ steps.svcs.outputs.elastic_url }}}"
+          # Ensure and persist
+          ensure_secret SERVER_SECRET
+          ensure_secret DB_URL
+          ensure_secret MONGO_URL
+          ensure_secret TRANSACTOR_URL
+          ensure_secret STORAGE_CONFIG
+          ensure_secret ELASTIC_URL
+          ensure_secret FRONT_URL
+          ensure_secret ACCOUNTS_URL
+          ensure_secret STATS_URL
+          # Generate SERVER_SECRET if absent
+          if [ -z "${SERVER_SECRET:-}" ]; then SERVER_SECRET=$(openssl rand -base64 32 | tr -d '\n'); fi
+          add_version SERVER_SECRET "$SERVER_SECRET"
+          add_version DB_URL "$db_url"
+          add_version MONGO_URL "$mongo_url"
+          add_version TRANSACTOR_URL "$trans_url"
+          add_version STORAGE_CONFIG "$storage_cfg"
+          add_version ELASTIC_URL "$elastic_url"
+          add_version FRONT_URL "$FRONT_URL"
+          add_version ACCOUNTS_URL "$ACCOUNTS_URL"
+          add_version STATS_URL "$STATS_URL"
+
       - name: 'Deploy to GKE (kustomize)'
         if: steps.km.outputs.exists == 'true'
         env:
@@ -380,13 +469,19 @@ jobs:
           kustomize edit set image front=$IMG_TAG/front:${GITHUB_SHA}
           kustomize edit set image server=$IMG_TAG/server:${GITHUB_SHA}
           kustomize edit set image account=$IMG_TAG/account:${GITHUB_SHA}
+          # Additional core services (best-effort)
+          kustomize edit set image workspace=$IMG_TAG/workspace:${GITHUB_SHA} || true
+          kustomize edit set image stats=$IMG_TAG/stats:${GITHUB_SHA} || true
+          kustomize edit set image collaborator=$IMG_TAG/collaborator:${GITHUB_SHA} || true
+          kustomize edit set image fulltext=$IMG_TAG/fulltext:${GITHUB_SHA} || true
           # Optional addons
           kustomize edit set image mail=$IMG_TAG/mail:${GITHUB_SHA} || true
           kustomize edit set image mail-worker=$IMG_TAG/mail-worker:${GITHUB_SHA} || true
           kustomize edit set image ai-bot=$IMG_TAG/ai-bot:${GITHUB_SHA} || true
           kustomize edit set image love=$IMG_TAG/love:${GITHUB_SHA} || true
           kustomize build . | kubectl apply -f -
-          kubectl rollout status deployment -n huly --timeout=180s || true
+          # Wait for rollouts (all deployments in namespace)
+          kubectl -n huly get deploy -o name | xargs -r -n1 -I{} kubectl -n huly rollout status {} --timeout=180s || true
 
       - name: 'Deploy using kubectl manifests (fallback)'
         if: steps.km.outputs.exists != 'true'

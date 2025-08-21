@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account
+  labels:
+    app: account
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: account
+  template:
+    metadata:
+      labels:
+        app: account
+    spec:
+      containers:
+        - name: account
+          image: account
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: SERVER_PORT
+              value: "3000"
+            - name: SERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: SERVER_SECRET
+            - name: DB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: DB_URL
+            - name: MONGO_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: MONGO_URL
+            - name: TRANSACTOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: TRANSACTOR_URL
+            - name: ACCOUNTS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: ACCOUNTS_URL
+            - name: FRONT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: FRONT_URL
+            - name: STATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: STATS_URL
+            - name: STORAGE_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: STORAGE_CONFIG
+            - name: DISABLE_SIGNUP
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: DISABLE_SIGNUP
+
+
