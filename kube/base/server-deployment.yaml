@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+  labels:
+    app: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: server
+  template:
+    metadata:
+      labels:
+        app: server
+    spec:
+      containers:
+        - name: server
+          image: server
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3333
+              name: ws
+          env:
+            - name: SERVER_PORT
+              value: "3333"
+            - name: SERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: SERVER_SECRET
+            - name: DB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: DB_URL
+            - name: MONGO_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: MONGO_URL
+            - name: STORAGE_CONFIG
+              valueFrom:
+                secretKeyRef:
+                  name: huly-secrets
+                  key: STORAGE_CONFIG
+            - name: FRONT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: huly-config
+                  key: FRONT_URL
+
+
